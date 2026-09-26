@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地模拟对象存储的数据目录
+.local-data/
+/tmp/
