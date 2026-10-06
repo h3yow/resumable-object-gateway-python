@@ -9,6 +9,7 @@
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,7 @@ class SessionStore:
         part_size: int,
         total_parts: int | None,
         overall_checksum: str | None,
+        tenant_id: str = "",
     ) -> Session:
         now = _utcnow()
         # 极小概率撞 id 时重试，避免目录已存在导致脏写
@@ -72,6 +74,7 @@ class SessionStore:
             session_id=session_id,
             object_key=object_key,
             status=SessionStatus.INITIATED,
+            tenant_id=tenant_id,
             part_size=part_size,
             total_parts=total_parts,
             overall_checksum_sha256=overall_checksum,
@@ -91,6 +94,18 @@ class SessionStore:
         payload = session.model_dump_json()
         _atomic_write(target, payload.encode("utf-8"))
         _fsync_dir(target.parent)
+
+    def discard(self, session_id: str) -> None:
+        """创建后随即失败的回滚：删除会话目录与全部暂存内容。"""
+        self.objects.remove_session_parts(session_id)
+        meta = self._meta_path(session_id)
+        if meta.exists():
+            meta.unlink()
+        d = self.dir / session_id
+        try:
+            d.rmdir()
+        except OSError:
+            pass
 
     def get(self, session_id: str) -> Session | None:
         path = self._meta_path(session_id)
@@ -131,11 +146,17 @@ class SessionStore:
         now = now or _utcnow()
         return session.expires_at <= now
 
-    def expire_sessions(self, now: datetime | None = None) -> int:
+    def expire_sessions(
+        self,
+        now: datetime | None = None,
+        on_expired: Callable[[Session], None] | None = None,
+    ) -> int:
         """扫描并清理超时的 INITIATED 会话。
 
         清理动作：状态置为 EXPIRED、删除暂存分块、保留 meta.json 作为可解释的
         终态记录（之后对该会话的写入将收到 SESSION_EXPIRED）。
+        ``on_expired(session)`` 在会话锁内、状态落盘后回调，用于归还额度等
+        善后；回调异常不阻断其它会话的清理。
         返回被清理的会话数。
         """
         now = now or _utcnow()
@@ -152,5 +173,7 @@ class SessionStore:
                 fresh.updated_at = now
                 self.save(fresh)
                 self.objects.remove_session_parts(fresh.session_id)
+                if on_expired is not None:
+                    on_expired(fresh)
                 cleaned += 1
         return cleaned

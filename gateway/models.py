@@ -24,6 +24,8 @@ class Session(BaseModel):
     session_id: str
     object_key: str
     status: SessionStatus
+    #: 调用方标识；空串为老用法（默认调用方），旧版 meta.json 无此字段时兼容为 ""
+    tenant_id: str = ""
     part_size: int
     total_parts: int | None = None
     overall_checksum_sha256: str | None = None
@@ -80,3 +82,25 @@ class ErrorResponse(BaseModel):
     message: str
     session_id: str | None = None
     detail: dict | None = None
+
+
+class TenantObjectInfo(BaseModel):
+    object_key: str
+    size: int
+    checksum_sha256: str
+    created_at: str | None = None
+
+
+class TenantUsageResponse(BaseModel):
+    """治理查询：某调用方的配额、占用与名下对象。"""
+
+    tenant_id: str
+    quota_max_bytes: int
+    quota_max_objects: int
+    committed_bytes: int
+    committed_objects: int
+    reserved_bytes: int
+    reserved_objects: int
+    remaining_bytes: int
+    remaining_objects: int
+    objects: list[TenantObjectInfo] = Field(default_factory=list)

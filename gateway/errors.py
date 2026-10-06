@@ -17,6 +17,14 @@ class ErrorCode(str, Enum):
     OBJECT_SIZE_EXCEEDED = "OBJECT_SIZE_EXCEEDED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     OBJECT_ALREADY_EXISTS = "OBJECT_ALREADY_EXISTS"
+    #: 查询不存在的对象（与不存在的会话可区分）
+    OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
+    #: 未配置/不存在的调用方
+    TENANT_NOT_FOUND = "TENANT_NOT_FOUND"
+    #: 调用方专属额度不足（与全局 QUOTA_EXCEEDED 可区分）
+    TENANT_QUOTA_EXCEEDED = "TENANT_QUOTA_EXCEEDED"
+    #: 分块尺寸越出调用方配置的上下限
+    PART_SIZE_OUT_OF_RANGE = "PART_SIZE_OUT_OF_RANGE"
 
 
 class GatewayError(Exception):

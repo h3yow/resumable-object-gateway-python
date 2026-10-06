@@ -22,6 +22,7 @@ from gateway.models import (
     PartUploadResponse,
     SessionProgress,
     SessionStatus,
+    TenantUsageResponse,
 )
 from gateway.service import UploadService
 
@@ -42,6 +43,10 @@ _ERROR_STATUS = {
     ErrorCode.OBJECT_SIZE_EXCEEDED: 413,
     ErrorCode.QUOTA_EXCEEDED: 507,
     ErrorCode.OBJECT_ALREADY_EXISTS: 409,
+    ErrorCode.OBJECT_NOT_FOUND: 404,
+    ErrorCode.TENANT_NOT_FOUND: 404,
+    ErrorCode.TENANT_QUOTA_EXCEEDED: 507,
+    ErrorCode.PART_SIZE_OUT_OF_RANGE: 413,
 }
 
 
@@ -102,12 +107,16 @@ def create_app(service: UploadService | None = None) -> FastAPI:
 
     # ------------------------------------------------------------ routes
     @app.post("/sessions", response_model=CreateSessionResponse, status_code=201)
-    async def create_session(body: CreateSessionRequest) -> CreateSessionResponse:
+    async def create_session(
+        body: CreateSessionRequest,
+        x_tenant_id: str | None = Header(default=None),
+    ) -> CreateSessionResponse:
         session = svc.initiate(
             object_key=body.object_key,
             part_size=body.part_size,
             total_parts=body.total_parts,
             overall_checksum=body.overall_checksum_sha256,
+            tenant_id=x_tenant_id,
         )
         return CreateSessionResponse(
             session_id=session.session_id,
@@ -181,6 +190,10 @@ def create_app(service: UploadService | None = None) -> FastAPI:
         # 仅返回元信息，避免大对象直接走 JSON；内容下载在本地验证脚本中直读磁盘
         meta = svc.objects.object_meta(object_key)
         return meta
+
+    @app.get("/tenants/{tenant_id}/usage", response_model=TenantUsageResponse)
+    async def get_tenant_usage(tenant_id: str) -> TenantUsageResponse:
+        return svc.tenant_usage(tenant_id)
 
     @app.post("/internal/sweep")
     async def sweep() -> dict:

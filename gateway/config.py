@@ -4,8 +4,9 @@
     GATEWAY_DATA_DIR=/tmp/demo GATEWAY_SESSION_TTL_SECONDS=60
 """
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -29,6 +30,9 @@ class Settings:
     max_object_count: int = 10_000
     #: 单个分块的最小字节数（最后一块不受此限，在服务层判定）
     min_part_bytes: int = 1
+    #: 命名调用方配额表：name -> {max_bytes, max_objects, min_part_bytes, max_part_bytes}
+    #: 未在此表中的命名调用方一律拒绝；不带调用方标识的老用法走上面的全局限额
+    tenants: dict = field(default_factory=dict)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -36,6 +40,17 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or raw.strip() == "":
         return default
     return int(raw)
+
+
+def _env_tenants() -> dict:
+    """解析 GATEWAY_TENANTS（JSON 对象）；未设置或为空时返回空表。"""
+    raw = os.environ.get("GATEWAY_TENANTS")
+    if raw is None or raw.strip() == "":
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("GATEWAY_TENANTS must be a JSON object")
+    return parsed
 
 
 def get_settings() -> Settings:
@@ -51,6 +66,7 @@ def get_settings() -> Settings:
         ),
         max_object_count=_env_int("GATEWAY_MAX_OBJECT_COUNT", 10_000),
         min_part_bytes=_env_int("GATEWAY_MIN_PART_BYTES", 1),
+        tenants=_env_tenants(),
     )
 
 

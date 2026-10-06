@@ -16,20 +16,30 @@ from gateway.models import (
     Session,
     SessionProgress,
     SessionStatus,
+    TenantObjectInfo,
+    TenantUsageResponse,
 )
 from gateway.sessions import SessionStore
 from gateway.storage import LocalObjectStore
+from gateway.tenants import DEFAULT_TENANT, TenantRegistry, UsageLedger
 
 logger = logging.getLogger("gateway.service")
 
 
 class UploadService:
-    """编排会话仓库与本地对象存储，实施全部业务规则。"""
+    """编排会话仓库、本地对象存储与调用方账本，实施全部业务规则。"""
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self.objects = LocalObjectStore(self.settings)
         self.sessions = SessionStore(self.settings, self.objects)
+        self.tenants = TenantRegistry(self.settings)
+        self.ledger = UsageLedger(self.tenants)
+        # 启动对账：以磁盘上的会话与对象元信息重建各调用方占用，
+        # 保证重启后不丢占用、也不多算；未完成的会话可继续续传。
+        self.ledger.rebuild(
+            self.sessions.all_sessions(), self.objects.list_object_metas()
+        )
 
     # -------------------------------------------------------------- helpers
     def _refresh_expiry(self, session: Session) -> None:
@@ -72,7 +82,11 @@ class UploadService:
         part_size: int = 0,
         total_parts: int | None = None,
         overall_checksum: str | None = None,
+        tenant_id: str | None = None,
     ) -> Session:
+        tenant_id = tenant_id or DEFAULT_TENANT
+        # 未配置的命名调用方在入口处即拒绝（TENANT_NOT_FOUND）
+        self.tenants.resolve(tenant_id)
         if not object_key or not object_key.strip():
             raise GatewayError(
                 ErrorCode.SESSION_NOT_INITIATED,
@@ -107,12 +121,27 @@ class UploadService:
             )
 
         session = self.sessions.create(
-            object_key, part_size, total_parts, overall_checksum
+            object_key, part_size, total_parts, overall_checksum, tenant_id
         )
+        if self.tenants.is_named(tenant_id):
+            try:
+                # 会话开始即占住 1 个对象位；占不住则本次创建整体失败
+                self.ledger.reserve_session(tenant_id, session.session_id)
+            except GatewayError:
+                self.sessions.discard(session.session_id)
+                logger.info(
+                    "session=%s tenant=%s action=initiate verdict=REJECTED "
+                    "reason=%s",
+                    session.session_id,
+                    tenant_id,
+                    ErrorCode.TENANT_QUOTA_EXCEEDED.value,
+                )
+                raise
         logger.info(
-            "session=%s action=initiate object_key=%s part_size=%d total_parts=%s "
-            "verdict=CREATED expires_at=%s",
+            "session=%s tenant=%s action=initiate object_key=%s part_size=%d "
+            "total_parts=%s verdict=CREATED expires_at=%s",
             session.session_id,
+            tenant_id or "-",
             object_key,
             part_size,
             total_parts,
@@ -153,6 +182,48 @@ class UploadService:
                 raise GatewayError(
                     ErrorCode.PART_NUMBER_OUT_OF_RANGE,
                     f"part_number {part_number} out of range [1, {upper}]",
+                    session_id=session_id,
+                )
+
+            # 单块尺寸上下限（按调用方配置）；尺寸越界直接按尺寸原因拒绝，
+            # 不先收下再报别的错。最后一块（声明了总数时）不受下限约束。
+            quota = self.tenants.resolve(session.tenant_id)
+            is_last = (
+                session.total_parts is not None
+                and part_number == session.total_parts
+            )
+            if len(data) < quota.min_part_bytes and not is_last:
+                logger.info(
+                    "session=%s tenant=%s part=%d action=upload verdict=REJECTED "
+                    "reason=%s size=%d min=%d",
+                    session_id,
+                    session.tenant_id or "-",
+                    part_number,
+                    ErrorCode.PART_SIZE_OUT_OF_RANGE.value,
+                    len(data),
+                    quota.min_part_bytes,
+                )
+                raise GatewayError(
+                    ErrorCode.PART_SIZE_OUT_OF_RANGE,
+                    f"part {part_number} size {len(data)} below minimum "
+                    f"{quota.min_part_bytes}",
+                    session_id=session_id,
+                )
+            if quota.max_part_bytes is not None and len(data) > quota.max_part_bytes:
+                logger.info(
+                    "session=%s tenant=%s part=%d action=upload verdict=REJECTED "
+                    "reason=%s size=%d max=%d",
+                    session_id,
+                    session.tenant_id or "-",
+                    part_number,
+                    ErrorCode.PART_SIZE_OUT_OF_RANGE.value,
+                    len(data),
+                    quota.max_part_bytes,
+                )
+                raise GatewayError(
+                    ErrorCode.PART_SIZE_OUT_OF_RANGE,
+                    f"part {part_number} size {len(data)} exceeds maximum "
+                    f"{quota.max_part_bytes}",
                     session_id=session_id,
                 )
 
@@ -213,7 +284,21 @@ class UploadService:
                 self.sessions.save(session)
                 return session, existing, True
 
-            self.objects.write_part(session_id, part_number, data)
+            named = self.tenants.is_named(session.tenant_id)
+            if named:
+                # 写入前原子“检查 + 占住”容量；占不住即拒绝，不先收数据
+                self.ledger.add_reserved_bytes(
+                    session.tenant_id, session_id, len(data)
+                )
+            try:
+                self.objects.write_part(session_id, part_number, data)
+            except BaseException:
+                if named:
+                    # 落盘失败：把本次占住的容量原样退回
+                    self.ledger.refund_reserved_bytes(
+                        session.tenant_id, session_id, len(data)
+                    )
+                raise
             record = PartRecord(
                 number=part_number,
                 size=len(data),
@@ -224,9 +309,10 @@ class UploadService:
             self._refresh_expiry(session)
             self.sessions.save(session)
             logger.info(
-                "session=%s part=%d action=upload verdict=ACCEPTED size=%d "
-                "checksum=%s received=%s",
+                "session=%s tenant=%s part=%d action=upload verdict=ACCEPTED "
+                "size=%d checksum=%s received=%s",
                 session_id,
+                session.tenant_id or "-",
                 part_number,
                 len(data),
                 actual_checksum,
@@ -308,31 +394,12 @@ class UploadService:
                     session_id=session_id,
                 )
 
-            # 4) 配额预检查（对象尚未创建，失败时对外无任何残留对象）
-            count = self.objects.object_count()
-            used_bytes = self.objects.total_bytes()
-            if count + 1 > self.settings.max_object_count:
-                raise GatewayError(
-                    ErrorCode.QUOTA_EXCEEDED,
-                    f"object count quota exceeded: {count + 1} > "
-                    f"{self.settings.max_object_count}",
-                    session_id=session_id,
-                )
-            if used_bytes + total_size > self.settings.max_total_object_bytes:
-                logger.info(
-                    "session=%s action=complete verdict=REJECTED reason=QUOTA_EXCEEDED "
-                    "used=%d incoming=%d quota=%d",
-                    session_id,
-                    used_bytes,
-                    total_size,
-                    self.settings.max_total_object_bytes,
-                )
-                raise GatewayError(
-                    ErrorCode.QUOTA_EXCEEDED,
-                    f"total bytes quota exceeded: {used_bytes}+{total_size} > "
-                    f"{self.settings.max_total_object_bytes}",
-                    session_id=session_id,
-                )
+            # 4) 额度：命名调用方由会话预留兜底（完成时不可能越界）；
+            #    默认调用方（老用法）在此原子“检查 + 记账”，语义与改造前的
+            #    全局限额一致，但并发完成不会越过额度。
+            named = self.tenants.is_named(session.tenant_id)
+            if not named:
+                self.ledger.commit_default_tenant(session_id, total_size)
 
             # 5) 原子合并 + 发布（内部做整体摘要校验，失败不发布）
             try:
@@ -341,8 +408,12 @@ class UploadService:
                     session.object_key,
                     declared_total,
                     wanted_checksum,
+                    tenant_id=session.tenant_id,
                 )
             except GatewayError as exc:
+                if not named:
+                    # 发布失败：退回默认调用方刚记的占用
+                    self.ledger.rollback_default_commit(session_id, total_size)
                 if exc.code is ErrorCode.OVERALL_CHECKSUM_MISMATCH:
                     logger.info(
                         "session=%s action=complete verdict=REJECTED "
@@ -353,7 +424,9 @@ class UploadService:
                     )
                 raise
 
-            # 6) 发布成功后置终态并清理暂存分块
+            # 6) 发布成功：命名调用方把预留原样结转，随后置终态并清理暂存分块
+            if named:
+                self.ledger.commit_session(session.tenant_id, session_id, size)
             session.status = SessionStatus.COMPLETED
             session.total_parts = declared_total
             session.overall_checksum_sha256 = actual_checksum
@@ -391,9 +464,12 @@ class UploadService:
             self._refresh_expiry(session)
             self.sessions.save(session)
             self.objects.remove_session_parts(session_id)
+            # 中止即把该会话占住的额度原样归还（幂等）
+            self.ledger.release_session(session.tenant_id, session_id)
             logger.info(
-                "session=%s action=abort verdict=ABORTED parts_discarded=%d",
+                "session=%s tenant=%s action=abort verdict=ABORTED parts_discarded=%d",
                 session_id,
+                session.tenant_id or "-",
                 len(session.parts),
             )
             return session
@@ -440,7 +516,50 @@ class UploadService:
 
     # ---------------------------------------------------------------- sweep
     def sweep_expired(self, now: datetime | None = None) -> int:
-        n = self.sessions.expire_sessions(now)
+        # 过期清理的同时把会话占住的额度原样归还（回调在会话锁内执行）
+        n = self.sessions.expire_sessions(
+            now,
+            on_expired=lambda s: self.ledger.release_session(
+                s.tenant_id, s.session_id
+            ),
+        )
         if n:
             logger.info("action=sweep verdict=EXPIRED count=%d", n)
         return n
+
+    # --------------------------------------------------------------- tenant
+    def tenant_usage(self, tenant_id: str | None) -> TenantUsageResponse:
+        """治理查询：某调用方的配额、当前占用、剩余与名下对象清单。"""
+        tenant_id = tenant_id or DEFAULT_TENANT
+        quota = self.tenants.resolve(tenant_id)  # 未知调用方 -> TENANT_NOT_FOUND
+        usage = self.ledger.usage(tenant_id)
+        objects = [
+            TenantObjectInfo(
+                object_key=m["object_key"],
+                size=int(m["size"]),
+                checksum_sha256=m["checksum_sha256"],
+                created_at=m.get("created_at"),
+            )
+            for m in self.objects.list_object_metas()
+            if (m.get("tenant_id") or DEFAULT_TENANT) == tenant_id
+        ]
+        objects.sort(key=lambda o: o.object_key)
+        return TenantUsageResponse(
+            tenant_id=tenant_id,
+            quota_max_bytes=quota.max_bytes,
+            quota_max_objects=quota.max_objects,
+            committed_bytes=usage.committed_bytes,
+            committed_objects=usage.committed_objects,
+            reserved_bytes=usage.reserved_bytes,
+            reserved_objects=usage.reserved_objects,
+            remaining_bytes=max(
+                0, quota.max_bytes - usage.committed_bytes - usage.reserved_bytes
+            ),
+            remaining_objects=max(
+                0,
+                quota.max_objects
+                - usage.committed_objects
+                - usage.reserved_objects,
+            ),
+            objects=objects,
+        )
