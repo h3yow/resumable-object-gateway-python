@@ -9,6 +9,7 @@
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,7 @@ class SessionStore:
         part_size: int,
         total_parts: int | None,
         overall_checksum: str | None,
+        caller_id: str = "default",
     ) -> Session:
         now = _utcnow()
         # 极小概率撞 id 时重试，避免目录已存在导致脏写
@@ -75,6 +77,7 @@ class SessionStore:
             part_size=part_size,
             total_parts=total_parts,
             overall_checksum_sha256=overall_checksum,
+            caller_id=caller_id,
             parts={},
             created_at=now,
             updated_at=now,
@@ -108,6 +111,14 @@ class SessionStore:
             )
         return session
 
+    def discard(self, session_id: str) -> None:
+        """删除一个尚未有任何分块的会话（用于创建后额度占住失败的回滚）。"""
+        import shutil
+
+        path = self.dir / session_id
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+
     def all_sessions(self) -> list[Session]:
         sessions: list[Session] = []
         if not self.dir.exists():
@@ -131,11 +142,17 @@ class SessionStore:
         now = now or _utcnow()
         return session.expires_at <= now
 
-    def expire_sessions(self, now: datetime | None = None) -> int:
+    def expire_sessions(
+        self,
+        now: datetime | None = None,
+        on_expired: "Callable[[Session], None] | None" = None,
+    ) -> int:
         """扫描并清理超时的 INITIATED 会话。
 
         清理动作：状态置为 EXPIRED、删除暂存分块、保留 meta.json 作为可解释的
         终态记录（之后对该会话的写入将收到 SESSION_EXPIRED）。
+        ``on_expired(session)`` 回调在会话锁内、状态落盘后触发，
+        用于归还该会话占住的调用方额度。
         返回被清理的会话数。
         """
         now = now or _utcnow()
@@ -152,5 +169,7 @@ class SessionStore:
                 fresh.updated_at = now
                 self.save(fresh)
                 self.objects.remove_session_parts(fresh.session_id)
+                if on_expired is not None:
+                    on_expired(fresh)
                 cleaned += 1
         return cleaned

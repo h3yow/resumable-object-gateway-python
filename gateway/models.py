@@ -27,6 +27,7 @@ class Session(BaseModel):
     part_size: int
     total_parts: int | None = None
     overall_checksum_sha256: str | None = None
+    caller_id: str = "default"
     parts: dict[int, PartRecord] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -38,6 +39,7 @@ class CreateSessionRequest(BaseModel):
     part_size: int = 0
     total_parts: int | None = None
     overall_checksum_sha256: str | None = None
+    caller_id: str | None = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -80,3 +82,30 @@ class ErrorResponse(BaseModel):
     message: str
     session_id: str | None = None
     detail: dict | None = None
+
+
+class ObjectMetaView(BaseModel):
+    """治理查询中单个对象的元信息视图。"""
+
+    object_key: str
+    size: int
+    checksum_sha256: str
+    caller_id: str | None = None
+    created_at: str | None = None
+
+
+class CallerUsageResponse(BaseModel):
+    """某个调用方的额度占用视图（committed=已落盘，reserved=会话占住）。"""
+
+    caller_id: str
+    used_bytes: int
+    used_objects: int
+    reserved_bytes: int
+    reserved_objects: int
+    limit_bytes: int
+    limit_objects: int
+    remaining_bytes: int
+    remaining_objects: int
+    min_part_bytes: int
+    max_part_bytes: int | None
+    objects: list[ObjectMetaView]

@@ -17,13 +17,24 @@ class ErrorCode(str, Enum):
     OBJECT_SIZE_EXCEEDED = "OBJECT_SIZE_EXCEEDED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     OBJECT_ALREADY_EXISTS = "OBJECT_ALREADY_EXISTS"
+    OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
+    PART_SIZE_OUT_OF_RANGE = "PART_SIZE_OUT_OF_RANGE"
+    CALLER_NOT_FOUND = "CALLER_NOT_FOUND"
 
 
 class GatewayError(Exception):
     """所有业务错误的基类，携带可区分错误码与判定依据。"""
 
-    def __init__(self, code: ErrorCode, message: str, *, session_id: str | None = None):
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        session_id: str | None = None,
+        caller_id: str | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.session_id = session_id
+        self.caller_id = caller_id

@@ -127,6 +127,7 @@ class LocalObjectStore:
         object_key: str,
         total_parts: int,
         expected_checksum: str | None,
+        caller_id: str | None = None,
     ) -> tuple[str, int]:
         """按序合并分块、计算整体摘要并原子发布对象。
 
@@ -186,6 +187,7 @@ class LocalObjectStore:
                     "object_key": object_key,
                     "size": size,
                     "checksum_sha256": actual_checksum,
+                    "caller_id": caller_id,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
                 _atomic_write(staging / "meta.json", json.dumps(meta).encode("utf-8"))
@@ -211,7 +213,7 @@ class LocalObjectStore:
         data = self._object_dir(object_key) / "data"
         if not data.exists():
             raise GatewayError(
-                ErrorCode.SESSION_NOT_FOUND,
+                ErrorCode.OBJECT_NOT_FOUND,
                 f"object {object_key!r} not found",
             )
         return data.read_bytes()
@@ -220,7 +222,7 @@ class LocalObjectStore:
         meta_path = self._object_dir(object_key) / "meta.json"
         if not meta_path.exists():
             raise GatewayError(
-                ErrorCode.SESSION_NOT_FOUND,
+                ErrorCode.OBJECT_NOT_FOUND,
                 f"object {object_key!r} not found",
             )
         return json.loads(meta_path.read_text())
@@ -244,3 +246,23 @@ class LocalObjectStore:
 
     def object_count(self) -> int:
         return sum(1 for _ in self._iter_object_dirs())
+
+    def list_objects(self, caller_id: str | None = None) -> list[dict]:
+        """列出已发布对象的元信息；给定 caller_id 时只返回该调用方名下的对象。
+
+        老版本写入的对象 meta.json 中没有 caller_id 字段，统一视为默认调用方。
+        """
+        from gateway.tenancy import DEFAULT_CALLER_ID
+
+        metas: list[dict] = []
+        for d in self._iter_object_dirs():
+            try:
+                meta = json.loads((d / "meta.json").read_text())
+            except (FileNotFoundError, ValueError):
+                continue
+            owner = meta.get("caller_id") or DEFAULT_CALLER_ID
+            if caller_id is not None and owner != caller_id:
+                continue
+            metas.append(meta)
+        metas.sort(key=lambda m: m.get("object_key", ""))
+        return metas

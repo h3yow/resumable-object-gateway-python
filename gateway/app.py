@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from gateway.config import Settings, get_settings
 from gateway.errors import ErrorCode, GatewayError
 from gateway.models import (
+    CallerUsageResponse,
     CompleteSessionRequest,
     CompleteSessionResponse,
     CreateSessionRequest,
@@ -42,6 +43,9 @@ _ERROR_STATUS = {
     ErrorCode.OBJECT_SIZE_EXCEEDED: 413,
     ErrorCode.QUOTA_EXCEEDED: 507,
     ErrorCode.OBJECT_ALREADY_EXISTS: 409,
+    ErrorCode.OBJECT_NOT_FOUND: 404,
+    ErrorCode.PART_SIZE_OUT_OF_RANGE: 400,
+    ErrorCode.CALLER_NOT_FOUND: 404,
 }
 
 
@@ -85,8 +89,9 @@ def create_app(service: UploadService | None = None) -> FastAPI:
     async def _on_gateway_error(_: Request, exc: GatewayError) -> JSONResponse:
         status = _ERROR_STATUS.get(exc.code, 400)
         logger.info(
-            "http_error session=%s code=%s status=%d reason=%s",
+            "http_error session=%s caller=%s code=%s status=%d reason=%s",
             exc.session_id,
+            exc.caller_id,
             exc.code.value,
             status,
             exc.message,
@@ -97,17 +102,23 @@ def create_app(service: UploadService | None = None) -> FastAPI:
                 "error_code": exc.code.value,
                 "message": exc.message,
                 "session_id": exc.session_id,
+                "caller_id": exc.caller_id,
             },
         )
 
     # ------------------------------------------------------------ routes
     @app.post("/sessions", response_model=CreateSessionResponse, status_code=201)
-    async def create_session(body: CreateSessionRequest) -> CreateSessionResponse:
+    async def create_session(
+        body: CreateSessionRequest,
+        x_caller_id: str | None = Header(default=None),
+    ) -> CreateSessionResponse:
+        # 老用法不带 caller_id，自动归属默认调用方
         session = svc.initiate(
             object_key=body.object_key,
             part_size=body.part_size,
             total_parts=body.total_parts,
             overall_checksum=body.overall_checksum_sha256,
+            caller_id=body.caller_id or x_caller_id,
         )
         return CreateSessionResponse(
             session_id=session.session_id,
@@ -182,32 +193,13 @@ def create_app(service: UploadService | None = None) -> FastAPI:
         meta = svc.objects.object_meta(object_key)
         return meta
 
+    @app.get("/tenants/{caller_id}/usage", response_model=CallerUsageResponse)
+    async def get_caller_usage(caller_id: str) -> CallerUsageResponse:
+        """治理入口：某调用方的占用、剩余额度与名下对象清单。"""
+        return svc.usage(caller_id)
+
     @app.post("/internal/sweep")
     async def sweep() -> dict:
         return {"expired": svc.sweep_expired()}
-
-    # --------------------------------------------- background expiry sweep
-    @contextlib.asynccontextmanager
-    async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
-        interval = settings.sweep_interval_seconds
-        stop = asyncio.Event()
-
-        async def _loop() -> None:
-            while not stop.is_set():
-                try:
-                    await asyncio.to_thread(svc.sweep_expired)
-                except Exception:  # noqa: BLE001 - 扫描异常不能杀死进程
-                    logger.exception("expiry sweep failed")
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=interval)
-
-        task = asyncio.create_task(_loop())
-        try:
-            yield
-        finally:
-            stop.set()
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
 
     return app

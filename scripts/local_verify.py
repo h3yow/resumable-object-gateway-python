@@ -75,6 +75,75 @@ def main() -> int:
     assert r.status_code == 409 and r.json()["error_code"] == "SESSION_COMPLETED"
     print("[5] write after completion rejected: SESSION_COMPLETED")
 
+    # ---- 调用方治理：独立额度、尺寸上下限、占住/归还、用量查询 -----------
+    from gateway.config import CallerPolicy
+
+    gov_settings = Settings(
+        data_dir=tempfile.mkdtemp(prefix="rogw-verify-gov-"),
+        caller_policies={
+            "alice": CallerPolicy(
+                max_bytes=64, max_objects=2, min_part_bytes=2, max_part_bytes=32
+            ),
+        },
+    )
+    gov = TestClient(create_app(UploadService(gov_settings)))
+
+    def _complete_one(client, key: str, payload: bytes, caller: str | None = None):
+        body = {"object_key": key, "total_parts": 1,
+                "overall_checksum_sha256": hashlib.sha256(payload).hexdigest()}
+        if caller:
+            body["caller_id"] = caller
+        r = client.post("/sessions", json=body)
+        assert r.status_code == 201, r.text
+        sid = r.json()["session_id"]
+        r = client.put(f"/sessions/{sid}/parts/1", content=payload)
+        assert r.status_code == 200, r.text
+        r = client.post(f"/sessions/{sid}/complete", json={})
+        assert r.status_code == 200, r.text
+        return sid
+
+    # alice 落盘一个对象；用量查询可见占用与名下对象
+    _complete_one(gov, "a1", b"hello", caller="alice")
+    r = gov.get("/tenants/alice/usage")
+    assert r.status_code == 200, r.text
+    usage = r.json()
+    assert usage["used_bytes"] == 5 and usage["used_objects"] == 1
+    assert usage["remaining_bytes"] == 59 and usage["remaining_objects"] == 1
+    assert [o["object_key"] for o in usage["objects"]] == ["a1"]
+    print(f"[6] usage query: alice used={usage['used_bytes']}B/"
+          f"{usage['used_objects']}obj, objects={usage['objects'][0]['object_key']}")
+
+    # 单块尺寸上下限：越界按尺寸原因立即拒绝
+    r = gov.post("/sessions", json={"object_key": "a2", "total_parts": 1,
+                                    "caller_id": "alice"})
+    a2_sid = r.json()["session_id"]
+    r = gov.put(f"/sessions/{a2_sid}/parts/1", content=b"x" * 33)  # > max 32
+    assert r.status_code == 400 and r.json()["error_code"] == \
+        "PART_SIZE_OUT_OF_RANGE", r.text
+    print("[7] oversized part rejected: PART_SIZE_OUT_OF_RANGE")
+
+    # 中止归还占住额度（reserved 归零），随后该会话不可再写
+    r = gov.post(f"/sessions/{a2_sid}/abort")
+    assert r.status_code == 200
+    r = gov.get("/tenants/alice/usage")
+    assert r.json()["reserved_objects"] == 0
+    print("[8] abort releases reserved quota")
+
+    # alice 再落盘一个对象占满对象数额度；第三个会话 -> 507 QUOTA_EXCEEDED；
+    # 默认调用方（老用法）完全不受影响
+    _complete_one(gov, "a3", b"world", caller="alice")
+    r = gov.post("/sessions", json={"object_key": "a4", "caller_id": "alice"})
+    assert r.status_code == 507 and r.json()["error_code"] == "QUOTA_EXCEEDED", r.text
+    _complete_one(gov, "d1", b"legacy still works")
+    print("[9] caller quota isolated: alice full -> QUOTA_EXCEEDED, default ok")
+
+    # 两类"查不到"可区分
+    r = gov.get("/objects/no-such")
+    assert r.status_code == 404 and r.json()["error_code"] == "OBJECT_NOT_FOUND"
+    r = gov.get("/sessions/no-such")
+    assert r.status_code == 404 and r.json()["error_code"] == "SESSION_NOT_FOUND"
+    print("[10] OBJECT_NOT_FOUND vs SESSION_NOT_FOUND distinguishable")
+
     print("LOCAL VERIFY OK")
     return 0
 

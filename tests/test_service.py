@@ -210,10 +210,10 @@ class TestComplete:
         s1 = svc.initiate("c1", total_parts=1, overall_checksum=sha256_hex(b"a"))
         svc.upload_part(s1.session_id, 1, b"a")
         svc.complete(s1.session_id)
-        s2 = svc.initiate("c2", total_parts=1)
-        svc.upload_part(s2.session_id, 1, b"b")
+        # 对象数量额度在会话创建时即占住：第二个会话直接创建失败，
+        # 错误码仍是可区分的 QUOTA_EXCEEDED
         with pytest.raises(GatewayError) as ei:
-            svc.complete(s2.session_id)
+            svc.initiate("c2", total_parts=1)
         assert ei.value.code is ErrorCode.QUOTA_EXCEEDED
         assert not svc.objects.object_exists("c2")
 
